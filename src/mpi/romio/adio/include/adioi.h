@@ -242,6 +242,17 @@ struct ADIOI_Fns_struct {
                                          int *error_code);
     int (*ADIOI_xxx_SetLock) (ADIO_File fd, int cmd, int type, ADIO_Offset offset, int whence,
                               ADIO_Offset len);
+    /* Local, non-collective durability with no cross-process communication:
+     * unlike ADIOI_xxx_Flush (which some drivers, e.g. GPFS/DAOS, implement as
+     * a communicator-wide barrier plus a designated aggregator fsync -- an
+     * optimization that assumes every rank in fd->comm calls it together),
+     * LocalFlush must make only the calling process's own writes durable.
+     * Required by the P1/P2/P3 MPI-IO consistency primitives, which call it
+     * from a proper subset of fd->comm and would deadlock against a
+     * barrier-based Flush. Drivers that don't set this field (e.g. DAOS,
+     * PVFS2) leave it NULL; callers must check before dispatching through it.
+     */
+    void (*ADIOI_xxx_LocalFlush) (ADIO_File fd, int *error_code);
 };
 
 /* optypes for ADIO_RequestD */
@@ -334,6 +345,11 @@ struct ADIOI_Fns_struct {
 
 #define ADIO_Flush(fd,error_code) (*(fd->fns->ADIOI_xxx_Flush))(fd,error_code)
 
+/* See ADIOI_xxx_LocalFlush's comment in struct ADIOI_Fns_struct. NULL on
+ * drivers that don't support it -- callers must check fd->fns->ADIOI_xxx_LocalFlush
+ * before using this macro. */
+#define ADIO_LocalFlush(fd,error_code) (*(fd->fns->ADIOI_xxx_LocalFlush))(fd,error_code)
+
 #define ADIO_Resize(fd,size,error_code)                 \
     (*(fd->fns->ADIOI_xxx_Resize))(fd,size,error_code)
 
@@ -388,6 +404,7 @@ void ADIOI_Info_print_keyvals(MPI_Info info);
 
 void ADIOI_GEN_Fcntl(ADIO_File fd, int flag, ADIO_Fcntl_t * fcntl_struct, int *error_code);
 void ADIOI_GEN_Flush(ADIO_File fd, int *error_code);
+void ADIOI_GEN_LocalFlush(ADIO_File fd, int *error_code);
 void ADIOI_GEN_OpenColl(ADIO_File fd, int rank, int access_mode, int *error_code);
 void ADIOI_SCALEABLE_OpenColl(ADIO_File fd, int rank, int access_mode, int *error_code);
 void ADIOI_FAILSAFE_OpenColl(ADIO_File fd, int rank, int access_mode, int *error_code);

@@ -1145,10 +1145,40 @@ int MPIR_File_sync_impl(MPI_File fh)
     goto fn_exit;
 }
 
+/* Local, non-communicating durability for the P1/P2/P3 consistency
+ * primitives below.  Unlike ADIO_Flush -- which on some drivers (GPFS, DAOS)
+ * is implemented as a barrier over the *original* file communicator plus a
+ * designated-aggregator fsync, an optimization that assumes every rank in
+ * that communicator calls it together -- these primitives call flush from a
+ * proper subset of the communicator, which would deadlock against such a
+ * driver. ADIOI_xxx_LocalFlush (see its comment in adioi.h) is required to
+ * make only the caller's own writes durable, with no cross-rank
+ * synchronization of its own. Drivers that don't support it (e.g. DAOS,
+ * PVFS2) leave the field NULL; report a clean error instead of
+ * dereferencing it. */
+static int sync_local_flush(ADIO_File adio_fh)
+{
+    int error_code = MPI_SUCCESS;
+
+    if (adio_fh->fns->ADIOI_xxx_LocalFlush == NULL) {
+        error_code = MPIO_Err_create_code(MPI_SUCCESS, MPIR_ERR_RECOVERABLE,
+                                          __func__, __LINE__, MPI_ERR_UNSUPPORTED_OPERATION,
+                                          "**io", "**io %s",
+                                          "the formal MPI-IO consistency primitives "
+                                          "(MPI_File_sync_to/from, MPI_File_sync_group, "
+                                          "MPI_File_release/acquire) are not supported on "
+                                          "this file system driver");
+        return error_code;
+    }
+
+    ADIO_LocalFlush(adio_fh, &error_code);
+    return error_code;
+}
+
 /* P1: Directed sync -- writer side.
  *
  * Formally establishes the sw_pair^{p->q} synchronizes-with edge.
- * Sequence: ADIO_Flush (fsync to storage) then MPI_Send (token to target).
+ * Sequence: local flush (fsync to storage) then MPI_Send (token to target).
  * The MPI_Send creates a happens-before ordering between the flush and the
  * matching MPI_Recv in MPIR_File_sync_from_impl.
  */
@@ -1168,7 +1198,7 @@ int MPIR_File_sync_to_impl(MPI_File fh, int target_rank, MPI_Comm comm)
     MPIO_CHECK_WRITABLE(fh, __func__, error_code);
 
     /* Flush dirty writes to storage -- this is the "release" of the write phase */
-    ADIO_Flush(adio_fh, &error_code);
+    error_code = sync_local_flush(adio_fh);
     if (error_code != MPI_SUCCESS)
         goto fn_fail;
 
@@ -1186,7 +1216,7 @@ int MPIR_File_sync_to_impl(MPI_File fh, int target_rank, MPI_Comm comm)
 /* P1: Directed sync -- reader side.
  *
  * Formally completes the sw_pair^{p->q} synchronizes-with edge.
- * Sequence: MPI_Recv (wait for producer's token) then ADIO_Flush (no-op if
+ * Sequence: MPI_Recv (wait for producer's token) then a local flush (no-op if
  * this process has no dirty writes, but ensures ROMIO's internal state is
  * consistent before subsequent reads).
  */
@@ -1213,7 +1243,7 @@ int MPIR_File_sync_from_impl(MPI_File fh, int source_rank, MPI_Comm comm)
 
     /* Flush this process's own dirty writes (if any) and let ROMIO reset
      * its internal dirty_write flag.  On a read-only handle this is a no-op. */
-    ADIO_Flush(adio_fh, &error_code);
+    error_code = sync_local_flush(adio_fh);
 
   fn_exit:
     return error_code;
@@ -1224,7 +1254,7 @@ int MPIR_File_sync_from_impl(MPI_File fh, int source_rank, MPI_Comm comm)
 /* P2: Group sync.
  *
  * Formally establishes sw_G between all pairs in G, achieving C2 for G.
- * Sequence: ADIO_Flush -> MPI_Barrier(subcomm) -> ADIO_Flush.
+ * Sequence: local flush -> MPI_Barrier(subcomm) -> local flush.
  * This is exactly sync-barrier-sync restricted to G instead of the full
  * file communicator, so processes outside G are never blocked.
  *
@@ -1247,7 +1277,7 @@ int MPIR_File_sync_group_impl(MPI_File fh, MPI_Group group)
 
     /* Step 1: flush this process's dirty writes to storage before the barrier
      * so that peers can read them after the barrier completes. */
-    ADIO_Flush(adio_fh, &error_code);
+    error_code = sync_local_flush(adio_fh);
     if (error_code != MPI_SUCCESS)
         goto fn_fail;
 
@@ -1266,7 +1296,7 @@ int MPIR_File_sync_group_impl(MPI_File fh, MPI_Group group)
     /* Step 4: second flush -- now that all peers have completed their flush
      * and the barrier has ordered them, reset ROMIO's internal state so
      * subsequent reads see the peers' data. */
-    ADIO_Flush(adio_fh, &error_code);
+    error_code = sync_local_flush(adio_fh);
 
   fn_cleanup:
     MPI_Comm_free(&subcomm);
@@ -1279,7 +1309,7 @@ int MPIR_File_sync_group_impl(MPI_File fh, MPI_Group group)
 /* P3: Release-acquire sync -- writer side.
  *
  * Establishes sw_ra^{p -> p'} for every p' in readers.
- * Sequence: ADIO_Flush then MPI_Isend(token) to each reader, Waitall.
+ * Sequence: local flush then MPI_Isend(token) to each reader, Waitall.
  *
  * Rank translation: writers/readers are subgroups of adio_fh->comm.
  * We obtain the file communicator's group once, batch-translate all
@@ -1305,7 +1335,7 @@ int MPIR_File_release_impl(MPI_File fh, MPI_Group writers, MPI_Group readers)
     MPIO_CHECK_WRITABLE(fh, __func__, error_code);
 
     /* Flush this writer's dirty data to storage before signalling readers. */
-    ADIO_Flush(adio_fh, &error_code);
+    error_code = sync_local_flush(adio_fh);
     if (error_code != MPI_SUCCESS)
         goto fn_fail;
 
@@ -1349,7 +1379,7 @@ int MPIR_File_release_impl(MPI_File fh, MPI_Group writers, MPI_Group readers)
 /* P3: Release-acquire sync -- reader side.
  *
  * Completes sw_ra^{p -> p'} for every p in writers.
- * Sequence: MPI_Irecv(token) from each writer, Waitall, then ADIO_Flush.
+ * Sequence: MPI_Irecv(token) from each writer, Waitall, then a local flush.
  */
 int MPIR_File_acquire_impl(MPI_File fh, MPI_Group writers, MPI_Group readers)
 {
@@ -1385,7 +1415,7 @@ int MPIR_File_acquire_impl(MPI_File fh, MPI_Group writers, MPI_Group readers)
     MPI_Group_free(&comm_group);
 
     /* Post a receive for each writer's token.  After Waitall, every writer
-     * has completed its ADIO_Flush, so all their writes are durable. */
+     * has completed its local flush, so all their writes are durable. */
     for (i = 0; i < nwriters; i++) {
         error_code = MPI_Irecv(NULL, 0, MPI_BYTE, comm_ranks[i],
                                ADIOI_SYNC_RA_TAG, adio_fh->comm, &reqs[i]);
@@ -1406,7 +1436,7 @@ int MPIR_File_acquire_impl(MPI_File fh, MPI_Group writers, MPI_Group readers)
 
   fn_flush:
     /* Reset ROMIO's internal state so subsequent reads see writers' data. */
-    ADIO_Flush(adio_fh, &error_code);
+    error_code = sync_local_flush(adio_fh);
 
   fn_exit:
     return error_code;

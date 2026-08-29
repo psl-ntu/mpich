@@ -38,3 +38,31 @@ void ADIOI_GEN_Flush(ADIO_File fd, int *error_code)
     if (fd->hints->synchronizing_flush > 0)
         MPI_Barrier(fd->comm);
 }
+
+/* Same as ADIOI_GEN_Flush, but deliberately never does the fd->comm barrier:
+ * callers that need only *this process's* writes durable, with no
+ * synchronization against any other rank (regardless of the
+ * romio_synchronized_flush hint). Needed by callers, such as the P1/P2/P3
+ * MPI-IO consistency primitives, that call this from a proper subset of
+ * fd->comm -- a barrier scoped to the full communicator there would deadlock
+ * against ranks outside that subset that never call it. */
+void ADIOI_GEN_LocalFlush(ADIO_File fd, int *error_code)
+{
+    int err;
+    static char myname[] = "ADIOI_GEN_LOCALFLUSH";
+
+    *error_code = MPI_SUCCESS;
+
+    if (fd->is_open > 0 && fd->dirty_write) {
+        err = fsync(fd->fd_sys);
+        /* --BEGIN ERROR HANDLING-- */
+        if (err == -1) {
+            *error_code = MPIO_Err_create_code(MPI_SUCCESS, MPIR_ERR_RECOVERABLE,
+                                               myname, __LINE__, MPI_ERR_IO,
+                                               "**io", "**io %s", strerror(errno));
+        } else {
+            fd->dirty_write = 0;
+        }
+        /* --END ERROR HANDLING-- */
+    }
+}

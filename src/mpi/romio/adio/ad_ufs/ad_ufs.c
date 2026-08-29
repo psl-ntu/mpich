@@ -42,8 +42,9 @@ struct ADIOI_Fns_struct ADIO_UFS_operations = {
     ADIOI_GEN_IreadStridedColl, /* IreadStridedColl */
     ADIOI_GEN_IwriteStridedColl,        /* IwriteStridedColl */
 #if defined(F_SETLKW64)
-    ADIOI_GEN_SetLock   /* SetLock */
+    ADIOI_GEN_SetLock,  /* SetLock */
 #else
-    ADIOI_GEN_SetLock64 /* SetLock */
+    ADIOI_GEN_SetLock64,        /* SetLock */
 #endif
+    ADIOI_GEN_LocalFlush        /* LocalFlush */
 };

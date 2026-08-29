@@ -47,8 +47,14 @@ struct ADIOI_Fns_struct ADIO_GPFS_operations = {
     ADIOI_GEN_IreadStridedColl, /* IreadStridedColl */
     ADIOI_GEN_IwriteStridedColl,        /* IwriteStridedColl */
 #if defined(F_SETLKW64)
-    ADIOI_GEN_SetLock   /* SetLock */
+    ADIOI_GEN_SetLock,  /* SetLock */
 #else
-    ADIOI_GEN_SetLock64 /* SetLock */
+    ADIOI_GEN_SetLock64,        /* SetLock */
 #endif
+    /* Deliberately ADIOI_GEN_LocalFlush, not ADIOI_GPFS_Flush: the latter
+     * does an unconditional MPI_Barrier(fd->comm) over the *original*
+     * collective-open communicator, which deadlocks when called (as P1/P2/P3
+     * do) from a proper subset of that communicator. GPFS's fd_sys is a real
+     * POSIX fd (see ad_gpfs_open.c), so a raw per-process fsync is valid here. */
+    ADIOI_GEN_LocalFlush        /* LocalFlush */
 };
