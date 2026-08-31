@@ -31,9 +31,16 @@
  * subcommunicator on every call was tried first and measured to cost far
  * more than the barrier itself (MPI_Comm_create_group's own context-ID
  * negotiation dominates), which is why the API takes an already-built
- * communicator instead of a group. This function validates that comm is
- * indeed a subset of fh's communicator (cheap, non-collective-negotiation
- * check) but does not construct or tear down any communicator itself.
+ * communicator instead of a group. This function does not construct, tear
+ * down, or validate comm: comm's group must be a subset of fh's
+ * communicator's group (PRECONDITION, not checked -- same convention as
+ * MPI_Comm_create_group's own "group must be a subset of comm" requirement,
+ * and as P1/P3's rank/group arguments, neither of which are validated
+ * against fh's communicator either). An earlier version validated this on
+ * every call; that check alone cost as much as the rest of the primitive
+ * combined, so it was removed to follow MPI's usual convention of trusting
+ * the caller for handle-relationship preconditions rather than paying a
+ * runtime cost on every call to catch programmer error.
  */
 
 #ifdef HAVE_WEAK_SYMBOLS
@@ -62,8 +69,10 @@ int MPI_File_sync_group(MPI_File fh, MPI_Comm comm)
 Input Parameters:
 . fh   - file handle (handle)
 . comm - subcommunicator of processes that participate in this sync (handle);
-         must be a subset of the communicator used to open fh, and should be
-         created once by the caller and reused across repeated calls
+         must be a subset of the communicator used to open fh (not verified;
+         behavior is undefined if violated, as with MPI_Comm_create_group's
+         own group-subset requirement), and should be created once by the
+         caller and reused across repeated calls
 
 Notes:
   All processes in comm must call this function collectively. After the
