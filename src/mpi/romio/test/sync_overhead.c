@@ -20,6 +20,12 @@
  *   2. P2 full:    MPI_File_sync_group, G = all nprocs
  *   3. P2 quarter: MPI_File_sync_group, G = nprocs/4 (first quarter)
  *   4. P2 half:    MPI_File_sync_group, G = nprocs/2 (first half)
+ *      P2's subcommunicators (comm_full/quarter/half) are each built ONCE at
+ *      setup via MPI_Comm_create_group and reused for every timed iteration
+ *      -- MPI_File_sync_group takes a caller-owned communicator, not a group,
+ *      specifically so this setup cost is paid once rather than on every
+ *      call (an earlier version built it fresh per call and measured that
+ *      cost to dominate the barrier itself).
  *   5. P3: MPI_File_release / MPI_File_acquire, fixed 4 writers + 4 readers
  *          regardless of nprocs (remaining processes are bystanders).
  *          This is the intended use case: a small subset synchronizes while
@@ -129,7 +135,7 @@ static void do_write(MPI_File fh)
 typedef struct {
     int method;         /* 0..5 */
     MPI_File fh;
-    MPI_Group g_full, g_quarter, g_half;
+    MPI_Comm comm_full, comm_quarter, comm_half;  /* P2: prebuilt, reused */
     MPI_Group w_group, r_group;  /* P3: fixed-size groups */
     int p3_nw, p3_nr;            /* number of writers / readers in P3 */
 } SyncCtx;
@@ -166,18 +172,18 @@ static double *time_sync(SyncCtx *ctx, int iters)
                 (void)0;
             break;
 
-        case 2: /* P2 full: sync_group on all nprocs */
-            MPI_CHECK(MPI_File_sync_group(ctx->fh, ctx->g_full));
+        case 2: /* P2 full: sync_group on all nprocs, on the prebuilt comm */
+            MPI_CHECK(MPI_File_sync_group(ctx->fh, ctx->comm_full));
             break;
 
-        case 3: /* P2 quarter: sync_group on nprocs/4 */
+        case 3: /* P2 quarter: sync_group on nprocs/4, on the prebuilt comm */
             if (mynod < nprocs / 4)
-                MPI_CHECK(MPI_File_sync_group(ctx->fh, ctx->g_quarter));
+                MPI_CHECK(MPI_File_sync_group(ctx->fh, ctx->comm_quarter));
             break;
 
-        case 4: /* P2 half: sync_group on nprocs/2 */
+        case 4: /* P2 half: sync_group on nprocs/2, on the prebuilt comm */
             if (mynod < nprocs / 2)
-                MPI_CHECK(MPI_File_sync_group(ctx->fh, ctx->g_half));
+                MPI_CHECK(MPI_File_sync_group(ctx->fh, ctx->comm_half));
             break;
 
         case 5: /* P3: release-acquire, fixed 4w+4r, rest are bystanders.
@@ -225,6 +231,30 @@ static MPI_Group make_range_group(int first, int last)
     MPI_Group_free(&world);
     free(ranks);
     return g;
+}
+
+/* Builds a subcommunicator spanning ranks [first, last], for use with
+ * MPI_File_sync_group (which takes a caller-owned communicator, not a
+ * group -- see its comment). Only ranks in [first, last] actually call
+ * MPI_Comm_create_group, as MPI-3.0 requires; other ranks get MPI_COMM_NULL
+ * back without participating in any collective here. Called once at setup,
+ * not on every sync -- that's the whole point of this API shape. */
+static MPI_Comm make_range_comm(int first, int last, int tag)
+{
+    MPI_Group world, g;
+    MPI_Comm comm = MPI_COMM_NULL;
+    int *ranks, i, n = last - first + 1;
+    ranks = (int *)malloc(n * sizeof(int));
+    for (i = 0; i < n; i++) ranks[i] = first + i;
+    MPI_Comm_group(MPI_COMM_WORLD, &world);
+    MPI_Group_incl(world, n, ranks, &g);
+    MPI_Group_free(&world);
+    free(ranks);
+
+    if (mynod >= first && mynod <= last)
+        MPI_CHECK(MPI_Comm_create_group(MPI_COMM_WORLD, g, tag, &comm));
+    MPI_Group_free(&g);
+    return comm;
 }
 
 /* ------------------------------------------------------------------ */
@@ -280,14 +310,15 @@ int main(int argc, char **argv)
                             MPI_MODE_CREATE | MPI_MODE_RDWR, info, &fh));
     MPI_CHECK(MPI_Info_free(&info));
 
-    /* Build groups */
+    /* Build P2's subcommunicators once, up front -- reused for every timed
+     * iteration below (see MPI_File_sync_group's comment for why). */
     memset(&ctx, 0, sizeof(ctx));
-    ctx.fh        = fh;
-    ctx.g_full    = make_range_group(0, nprocs - 1);
-    ctx.g_quarter = (nprocs >= 4) ? make_range_group(0, nprocs / 4 - 1)
-                                  : ctx.g_full;
-    ctx.g_half    = (nprocs >= 2) ? make_range_group(0, nprocs / 2 - 1)
-                                  : ctx.g_full;
+    ctx.fh          = fh;
+    ctx.comm_full    = make_range_comm(0, nprocs - 1, 200);
+    ctx.comm_quarter = (nprocs >= 4) ? make_range_comm(0, nprocs / 4 - 1, 201)
+                                     : ctx.comm_full;
+    ctx.comm_half    = (nprocs >= 2) ? make_range_comm(0, nprocs / 2 - 1, 202)
+                                     : ctx.comm_full;
 
     /* P3 uses a fixed group size (4 writers, 4 readers) regardless of nprocs.
      * Writers = first p3_nw ranks; readers = last p3_nr ranks.
@@ -329,12 +360,22 @@ int main(int argc, char **argv)
         free(times);
     }
 
-    /* Cleanup */
+    /* Cleanup. Check comm_quarter's alias to comm_full BEFORE freeing
+     * comm_full -- freeing sets ctx.comm_full to MPI_COMM_NULL by reference,
+     * which would make a post-free comparison wrongly see them as distinct
+     * and double-free the same handle. Every rank has a real comm_full (it
+     * spans everyone), but comm_quarter/comm_half are MPI_COMM_NULL on ranks
+     * outside their range, so guard each free accordingly. */
     free(wbuf);
-    MPI_Group_free(&ctx.g_full);
-    if (nprocs >= 4 && ctx.g_quarter != ctx.g_full)
-        MPI_Group_free(&ctx.g_quarter);
-    MPI_Group_free(&ctx.g_half);
+    {
+        int quarter_is_alias = (ctx.comm_quarter == ctx.comm_full);
+        if (ctx.comm_full != MPI_COMM_NULL)
+            MPI_Comm_free(&ctx.comm_full);
+        if (!quarter_is_alias && ctx.comm_quarter != MPI_COMM_NULL)
+            MPI_Comm_free(&ctx.comm_quarter);
+        if (ctx.comm_half != MPI_COMM_NULL)
+            MPI_Comm_free(&ctx.comm_half);
+    }
     MPI_Group_free(&ctx.w_group);
     MPI_Group_free(&ctx.r_group);
     MPI_CHECK(MPI_File_close(&fh));

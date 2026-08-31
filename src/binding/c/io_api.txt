@@ -70,7 +70,7 @@ MPI_File_sync_from:
     .skip: validate-source_rank
 
 MPI_File_sync_group:
-    .desc: Group barrier sync for a subset of processes (P2 primitive)
+    .desc: Barrier sync on a caller-provided subcommunicator (P2 primitive)
 
 MPI_File_release:
     .desc: Release-side of release-acquire sync from writers to readers (P3 primitive)

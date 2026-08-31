@@ -15,11 +15,12 @@
  *     Verifies: 0 violations over N_ITERS iterations.
  *
  *   T2 -- P2, Group Sync, AP_G (subgroup):
- *     Processes {0..k-1} form subgroup G (k = nprocs/2).  Each writes its
- *     rank to a dedicated file slot, calls MPI_File_sync_group within G,
- *     then reads all peers' slots.  Processes {k..n-1} open the file but
- *     deliberately do NOT participate in the sync, exercising the subgroup
- *     isolation property.
+ *     Processes {0..k-1} form subgroup G (k = nprocs/2), which builds a
+ *     subcommunicator once and reuses it across iterations.  Each writes its
+ *     rank to a dedicated file slot, calls MPI_File_sync_group on that
+ *     subcommunicator, then reads all peers' slots.  Processes {k..n-1} open
+ *     the file but deliberately do NOT participate in the sync, exercising
+ *     the subgroup isolation property.
  *     Verifies: 0 violations within G over N_ITERS iterations.
  *
  *   T3 -- P3, Release-Acquire, AP_WR (writer-reader phases):
@@ -49,6 +50,7 @@
 
 #define N_ITERS     200
 #define SENTINEL    0xDEADBEEF
+#define T2_SUBCOMM_TAG 100
 
 /* Each "slot" in the file is one int (4 bytes).  We use nprocs slots so
  * each process has its own dedicated region, avoiding unintentional conflicts
@@ -214,6 +216,7 @@ static int t2_run(const char *filename, int sync_mode)
 {
     MPI_File fh;
     MPI_Group world_group, g_group;
+    MPI_Comm g_comm = MPI_COMM_NULL;
     int k, iter, errs = 0, in_G;
     int i;
 
@@ -222,7 +225,11 @@ static int t2_run(const char *filename, int sync_mode)
     k = nprocs / 2;
     in_G = (mynod < k);
 
-    /* Build group G from ranks 0..k-1 */
+    /* Build group G from ranks 0..k-1, and a subcommunicator spanning G,
+     * ONCE here -- MPI_File_sync_group takes a caller-owned subcommunicator
+     * and reuses it across all N_ITERS calls below rather than recreating
+     * one per call (recreating it per call was measured to cost far more
+     * than the barrier itself; see MPIR_File_sync_group_impl's comment). */
     {
         int *g_ranks = (int *)malloc(k * sizeof(int));
         for (i = 0; i < k; i++) g_ranks[i] = i;
@@ -231,6 +238,8 @@ static int t2_run(const char *filename, int sync_mode)
         MPI_Group_free(&world_group);
         free(g_ranks);
     }
+    if (in_G)
+        MPI_CHECK(MPI_Comm_create_group(MPI_COMM_WORLD, g_group, T2_SUBCOMM_TAG, &g_comm));
 
     init_file(filename);
     fh = open_file(filename, MPI_COMM_WORLD);
@@ -248,9 +257,10 @@ static int t2_run(const char *filename, int sync_mode)
             MPI_Barrier(MPI_COMM_WORLD);
             MPI_CHECK(MPI_File_sync(fh));
             break;
-        case 2: /* P2: group sync -- only G participates */
+        case 2: /* P2: group sync -- only G participates, on the
+                 * pre-built, reused subcommunicator */
             if (in_G)
-                MPI_CHECK(MPI_File_sync_group(fh, g_group));
+                MPI_CHECK(MPI_File_sync_group(fh, g_comm));
             /* Processes outside G do nothing -- this is the correctness point */
             break;
         default: /* no sync */
@@ -273,6 +283,8 @@ static int t2_run(const char *filename, int sync_mode)
         MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     }
 
+    if (in_G)
+        MPI_Comm_free(&g_comm);
     MPI_Group_free(&g_group);
     MPI_CHECK(MPI_File_close(&fh));
     return global_violations(errs);

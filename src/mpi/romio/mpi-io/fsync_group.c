@@ -19,13 +19,21 @@
  * by any p' ∈ G after the call returns.
  *
  * Implementation: the sync-barrier-sync idiom restricted to G.
- *   1. ADIO_Flush  -- flush this process's dirty writes to storage
- *   2. MPI_Barrier(subcomm)  -- all-pairs synchronization within G
- *   3. ADIO_Flush  -- now that all peers have flushed, pull their data into
- *                     visibility (resets dirty_write; no-op if nothing to do)
+ *   1. ADIO_LocalFlush  -- flush this process's dirty writes to storage
+ *   2. MPI_Barrier(comm)  -- all-pairs synchronization within G
+ *   3. ADIO_LocalFlush  -- now that all peers have flushed, pull their data
+ *                          into visibility (resets dirty_write; no-op if
+ *                          nothing to do)
  *
- * The subcomm is created with MPI_Comm_create_group so that only processes
- * in G participate -- processes outside G are not disturbed.
+ * comm is a subcommunicator spanning exactly G, created and owned by the
+ * caller (e.g. via MPI_Comm_create_group at setup time) and reused across
+ * repeated calls -- NOT created fresh inside this function. Building a new
+ * subcommunicator on every call was tried first and measured to cost far
+ * more than the barrier itself (MPI_Comm_create_group's own context-ID
+ * negotiation dominates), which is why the API takes an already-built
+ * communicator instead of a group. This function validates that comm is
+ * indeed a subset of fh's communicator (cheap, non-collective-negotiation
+ * check) but does not construct or tear down any communicator itself.
  */
 
 #ifdef HAVE_WEAK_SYMBOLS
@@ -37,7 +45,7 @@
 #elif defined(HAVE_PRAGMA_CRI_DUP)
 #pragma _CRI duplicate MPI_File_sync_group as PMPI_File_sync_group
 #elif defined(HAVE_WEAK_ATTRIBUTE)
-int MPI_File_sync_group(MPI_File fh, MPI_Group group)
+int MPI_File_sync_group(MPI_File fh, MPI_Comm comm)
     __attribute__ ((weak, alias("PMPI_File_sync_group")));
 #endif
 
@@ -48,27 +56,30 @@ int MPI_File_sync_group(MPI_File fh, MPI_Group group)
 
 /*@
     MPI_File_sync_group - Flush writes to storage and synchronize with all
-                          processes in a subgroup (group consistency, C2 level)
+                          processes in a subcommunicator (group consistency,
+                          C2 level)
 
 Input Parameters:
-. fh    - file handle (handle)
-. group - group of processes that participate in this sync (handle);
-          must be a subgroup of the communicator used to open fh
+. fh   - file handle (handle)
+. comm - subcommunicator of processes that participate in this sync (handle);
+         must be a subset of the communicator used to open fh, and should be
+         created once by the caller and reused across repeated calls
 
 Notes:
-  All processes in group must call this function collectively.  After the
-  call returns on all processes in group, every write issued by any process
-  in group before the call is visible to reads issued by any process in group
-  after the call.  Processes not in group are not involved and are not blocked.
+  All processes in comm must call this function collectively. After the
+  call returns on all processes in comm, every write issued by any process
+  in comm before the call is visible to reads issued by any process in comm
+  after the call. Processes not in comm are not involved and are not blocked.
+  This function does not create or free comm; the caller owns its lifetime.
 
 .N fortran
 @*/
-int MPI_File_sync_group(MPI_File fh, MPI_Group group)
+int MPI_File_sync_group(MPI_File fh, MPI_Comm comm)
 {
     int error_code;
     ROMIO_THREAD_CS_ENTER();
 
-    error_code = MPIR_File_sync_group_impl(fh, group);
+    error_code = MPIR_File_sync_group_impl(fh, comm);
     if (error_code) {
         goto fn_fail;
     }

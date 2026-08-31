@@ -253,7 +253,7 @@ int MPI_File_sync(MPI_File fh) ROMIO_API_PUBLIC;
 /* Prototype sync primitives */
 int MPI_File_sync_to(MPI_File fh, int target_rank, MPI_Comm comm) ROMIO_API_PUBLIC;
 int MPI_File_sync_from(MPI_File fh, int source_rank, MPI_Comm comm) ROMIO_API_PUBLIC;
-int MPI_File_sync_group(MPI_File fh, MPI_Group group) ROMIO_API_PUBLIC;
+int MPI_File_sync_group(MPI_File fh, MPI_Comm comm) ROMIO_API_PUBLIC;
 int MPI_File_release(MPI_File fh, MPI_Group writers, MPI_Group readers) ROMIO_API_PUBLIC;
 int MPI_File_acquire(MPI_File fh, MPI_Group writers, MPI_Group readers) ROMIO_API_PUBLIC;
 
@@ -562,7 +562,7 @@ int PMPI_File_sync(MPI_File) ROMIO_API_PUBLIC;
 /* Prototype sync primitives */
 int PMPI_File_sync_to(MPI_File fh, int target_rank, MPI_Comm comm) ROMIO_API_PUBLIC;
 int PMPI_File_sync_from(MPI_File fh, int source_rank, MPI_Comm comm) ROMIO_API_PUBLIC;
-int PMPI_File_sync_group(MPI_File fh, MPI_Group group) ROMIO_API_PUBLIC;
+int PMPI_File_sync_group(MPI_File fh, MPI_Comm comm) ROMIO_API_PUBLIC;
 int PMPI_File_release(MPI_File fh, MPI_Group writers, MPI_Group readers) ROMIO_API_PUBLIC;
 int PMPI_File_acquire(MPI_File fh, MPI_Group writers, MPI_Group readers) ROMIO_API_PUBLIC;
 

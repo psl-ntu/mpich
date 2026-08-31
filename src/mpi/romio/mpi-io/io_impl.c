@@ -1175,6 +1175,53 @@ static int sync_local_flush(ADIO_File adio_fh)
     return error_code;
 }
 
+/* P2 (MPI_File_sync_group) takes a caller-owned subcommunicator rather than
+ * a group, so this checks that its membership really is a subset of
+ * adio_fh->comm's -- preserving the G subseteq C precondition the formal
+ * model assumes -- without repeating the expensive collective negotiation
+ * MPI_Comm_create_group would do. MPI_Group_translate_ranks is a purely
+ * local, non-collective-negotiation lookup: any rank in comm's group that
+ * has no corresponding rank in adio_fh->comm's group translates to
+ * MPI_UNDEFINED, which is exactly the "not a subset" case. */
+static int check_subgroup_of_file_comm(ADIO_File adio_fh, MPI_Comm comm)
+{
+    int error_code = MPI_SUCCESS;
+    MPI_Group file_group = MPI_GROUP_NULL, sub_group = MPI_GROUP_NULL;
+    int sub_size, i, is_subset = 1;
+    int *ranks_in = NULL, *ranks_out = NULL;
+
+    MPI_Comm_group(adio_fh->comm, &file_group);
+    MPI_Comm_group(comm, &sub_group);
+    MPI_Group_size(sub_group, &sub_size);
+
+    ranks_in = (int *) ADIOI_Malloc(sub_size * sizeof(int));
+    ranks_out = (int *) ADIOI_Malloc(sub_size * sizeof(int));
+    for (i = 0; i < sub_size; i++)
+        ranks_in[i] = i;
+
+    MPI_Group_translate_ranks(sub_group, sub_size, ranks_in, file_group, ranks_out);
+    for (i = 0; i < sub_size; i++) {
+        if (ranks_out[i] == MPI_UNDEFINED) {
+            is_subset = 0;
+            break;
+        }
+    }
+
+    ADIOI_Free(ranks_in);
+    ADIOI_Free(ranks_out);
+    MPI_Group_free(&file_group);
+    MPI_Group_free(&sub_group);
+
+    if (!is_subset) {
+        error_code = MPIO_Err_create_code(MPI_SUCCESS, MPIR_ERR_RECOVERABLE,
+                                          __func__, __LINE__, MPI_ERR_ARG,
+                                          "**io", "**io %s",
+                                          "MPI_File_sync_group: comm is not a subcommunicator "
+                                          "of the communicator used to open fh");
+    }
+    return error_code;
+}
+
 /* P1: Directed sync -- writer side.
  *
  * Formally establishes the sw_pair^{p->q} synchronizes-with edge.
@@ -1254,17 +1301,22 @@ int MPIR_File_sync_from_impl(MPI_File fh, int source_rank, MPI_Comm comm)
 /* P2: Group sync.
  *
  * Formally establishes sw_G between all pairs in G, achieving C2 for G.
- * Sequence: local flush -> MPI_Barrier(subcomm) -> local flush.
+ * Sequence: local flush -> MPI_Barrier(comm) -> local flush.
  * This is exactly sync-barrier-sync restricted to G instead of the full
  * file communicator, so processes outside G are never blocked.
  *
- * MPI_Comm_create_group is MPI-3.0 and only requires processes in the group
- * to participate, making it safe to call without involving non-G processes.
+ * comm is a subcommunicator spanning exactly G, created once by the caller
+ * (e.g. via MPI_Comm_create_group at setup time) and reused across repeated
+ * calls -- this function does not create or free any communicator. An
+ * earlier version called MPI_Comm_create_group here, fresh, on every call;
+ * measurement showed that cost (a real collective context-ID negotiation,
+ * not captured by the paper's cost model) dominates the barrier itself,
+ * making per-call subcommunicator creation a net loss versus the very
+ * full-communicator baseline this primitive is meant to beat.
  */
-int MPIR_File_sync_group_impl(MPI_File fh, MPI_Group group)
+int MPIR_File_sync_group_impl(MPI_File fh, MPI_Comm comm)
 {
     int error_code = MPI_SUCCESS;
-    MPI_Comm subcomm = MPI_COMM_NULL;
 
     ADIO_File adio_fh = MPIO_File_resolve(fh);
     MPIO_CHECK_FILE_HANDLE(adio_fh, __func__, error_code);
@@ -1275,31 +1327,28 @@ int MPIR_File_sync_group_impl(MPI_File fh, MPI_Group group)
         goto fn_fail;
     }
 
+    /* Cheap (non-collective-negotiation) check that comm really is a
+     * subcommunicator of the file's communicator, preserving G subseteq C. */
+    error_code = check_subgroup_of_file_comm(adio_fh, comm);
+    if (error_code != MPI_SUCCESS)
+        goto fn_fail;
+
     /* Step 1: flush this process's dirty writes to storage before the barrier
      * so that peers can read them after the barrier completes. */
     error_code = sync_local_flush(adio_fh);
     if (error_code != MPI_SUCCESS)
         goto fn_fail;
 
-    /* Step 2: create a sub-communicator spanning exactly G so that the barrier
-     * below does not involve processes outside G.  MPI_Comm_create_group only
-     * requires participation from processes in the group. */
-    error_code = MPI_Comm_create_group(adio_fh->comm, group, ADIOI_SYNC_GROUP_TAG, &subcomm);
+    /* Step 2: barrier within G -- establishes the all-pairs sw_G edges */
+    error_code = MPI_Barrier(comm);
     if (error_code != MPI_SUCCESS)
         goto fn_fail;
 
-    /* Step 3: barrier within G -- establishes the all-pairs sw_G edges */
-    error_code = MPI_Barrier(subcomm);
-    if (error_code != MPI_SUCCESS)
-        goto fn_cleanup;
-
-    /* Step 4: second flush -- now that all peers have completed their flush
+    /* Step 3: second flush -- now that all peers have completed their flush
      * and the barrier has ordered them, reset ROMIO's internal state so
      * subsequent reads see the peers' data. */
     error_code = sync_local_flush(adio_fh);
 
-  fn_cleanup:
-    MPI_Comm_free(&subcomm);
   fn_exit:
     return error_code;
   fn_fail:

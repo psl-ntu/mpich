@@ -158,17 +158,20 @@ int MPIR_File_sync_impl(MPI_File fh);
 /* P1: directed sync (process-pair consistency, C1 level) */
 int MPIR_File_sync_to_impl(MPI_File fh, int target_rank, MPI_Comm comm);
 int MPIR_File_sync_from_impl(MPI_File fh, int source_rank, MPI_Comm comm);
-/* P2: group sync (group consistency, C2 level) */
-int MPIR_File_sync_group_impl(MPI_File fh, MPI_Group group);
+/* P2: group sync (group consistency, C2 level). comm is a caller-created,
+ * caller-owned subcommunicator of fh's communicator, reused across calls;
+ * this avoids re-paying MPI_Comm_create_group's cost on every sync. */
+int MPIR_File_sync_group_impl(MPI_File fh, MPI_Comm comm);
 /* P3: release-acquire sync (asymmetric writer->reader C2) */
 int MPIR_File_release_impl(MPI_File fh, MPI_Group writers, MPI_Group readers);
 int MPIR_File_acquire_impl(MPI_File fh, MPI_Group writers, MPI_Group readers);
 
-/* Private tags used by the directed/group/release-acquire sync primitives.
+/* Private tags used by the directed/release-acquire sync primitives.
  * A production implementation should allocate these from MPICH's internal
- * tag pool; for this prototype fixed values in the valid tag range are used. */
+ * tag pool; for this prototype fixed values in the valid tag range are used.
+ * P2 (MPI_File_sync_group) needs no tag: it takes a caller-owned
+ * subcommunicator instead of creating one itself. */
 #define ADIOI_SYNC_TO_TAG    17
-#define ADIOI_SYNC_GROUP_TAG 18
 #define ADIOI_SYNC_RA_TAG    19
 int MPIR_File_write_impl(MPI_File fh, const void *buf, MPI_Aint count, MPI_Datatype datatype,
                          MPI_Status * status);

@@ -2794,7 +2794,7 @@ MPI_File_sync_from:
     comm: COMMUNICATOR, [communicator]
 MPI_File_sync_group:
     fh: FILE, [file handle]
-    group: GROUP, [group of processes participating in the sync]
+    comm: COMMUNICATOR, [subcommunicator spanning the participating processes; caller-created and reused across calls, must be a subset of fh's communicator]
 MPI_File_release:
     fh: FILE, [file handle]
     writers: GROUP, [group of writer processes]
